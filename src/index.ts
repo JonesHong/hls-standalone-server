@@ -1,5 +1,5 @@
-export * from './tus-standalone/fileMetadata';
-export * from './tus-standalone/tus.standalone';
-export * from './tus-standalone/uploader';
+export * from './hls-standalone/fileMetadata';
+export * from './hls-standalone/hls.standalone';
+export * from './hls-standalone/uploader';
 
-export * from './tus-standalone/tus'
+export * from './hls-standalone/hls'

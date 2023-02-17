@@ -11,7 +11,8 @@ const HlsServer = require('hls-server');
 import { performance } from 'perf_hooks';
 import { FileTransferred, HLSEvent, HLSEventTriggered } from "./event";
 import { DateTime } from "luxon";
-import { v4Generator } from "./Generator";
+import { v4 } from "uuid";
+// import { v4Generator } from "./Generator";
 const ffmpeg = require('fluent-ffmpeg');
 
 
@@ -67,96 +68,101 @@ export class HlsStandalone {
 
 
     constructor(configs?: { host?: string, port?: number, path?: string, dir?: string }) {
-        this.Event$
-            .pipe(
-                map(event => {
-                    let now = DateTime.fromJSDate(new Date());
-                    let eventPayload = new HLSEventTriggered({
-                        dateTime: now.valueOf(),
-                        from: `http://${this.host}:${this.port}${this.path}`,
-                        event
-                    });
-                    if (this._EventLogs.length > this._EventLogLengthLimit) {
-                        this._EventLogs.slice(this._EventLogs.length - this._EventLogLengthLimit);
-                    }
-                    if (HlsRegister.EventLogs.length > HlsRegister.EventLogLengthLimit) {
-                        HlsRegister.EventLogs.slice(HlsRegister.EventLogs.length - HlsRegister.EventLogLengthLimit);
-                    }
-                    this._EventLogs.push(eventPayload);
-                    HlsRegister.EventLogs.push(eventPayload);
+        try {
+
+            this.Event$
+                .pipe(
+                    map(event => {
+                        let now = DateTime.fromJSDate(new Date());
+                        let eventPayload = new HLSEventTriggered({
+                            dateTime: now.valueOf(),
+                            from: `http://${this.host}:${this.port}${this.path}`,
+                            event
+                        });
+                        if (this._EventLogs.length > this._EventLogLengthLimit) {
+                            this._EventLogs.slice(this._EventLogs.length - this._EventLogLengthLimit);
+                        }
+                        if (HlsRegister.EventLogs.length > HlsRegister.EventLogLengthLimit) {
+                            HlsRegister.EventLogs.slice(HlsRegister.EventLogs.length - HlsRegister.EventLogLengthLimit);
+                        }
+                        this._EventLogs.push(eventPayload);
+                        HlsRegister.EventLogs.push(eventPayload);
+                    })
+                )
+                .subscribe();
+            if (!!configs?.host) this._host = configs.host;
+            if (!!configs?.port) this._port = configs.port;
+            if (!!configs?.path) this._path = configs.path;
+            if (!!configs?.dir) this._dir = configs.dir;
+
+            if (!existsSync(`./${this.dir}`))
+                mkdirSync(`./${this.dir}`, { "recursive": true });
+
+            this.app.get('/', (req, res: express.Response) => {
+                res.statusCode = 200;
+                res.setHeader('Content-Type', 'text/html');
+                res.sendFile(`${resolve(__dirname, "../../../public/hls/index.html")}`);
+            });
+            this.app.get('/convert-to-hls/:filename', (req, res: express.Response) => {
+                console.log("url: ", req.url)
+                console.log("params: ", req.params)
+                let { filename } = req.params;
+                this.ToHls$(`./uploads/video/${filename}`).subscribe(val => {
+                    res.send(val);
                 })
-            )
-            .subscribe();
-        if (!!configs?.host) this._host = configs.host;
-        if (!!configs?.port) this._port = configs.port;
-        if (!!configs?.path) this._path = configs.path;
-        if (!!configs?.dir) this._dir = configs.dir;
+            });
 
-        if (!existsSync(`./${this.dir}`))
-            mkdirSync(`./${this.dir}`, { "recursive": true });
+            this._hlsServer = new HlsServer(this._app, {
+                path: this.path, // Base URI to output Hls streams
+                dir: this.dir, // Directory that input files are stored
+                provider: {
+                    exists: (req, callback) => { // check if a file exists (always called before the below methods)
+                        // console.log("hlsServer.provider.exists", req.filePath);
+                        let exists = existsSync(req.filePath);
+                        callback(null, exists);
+                        // callback(null, true)                 // File exists and is ready to start streaming
+                        // callback(new Error("Server Error!")) // 500 error
+                        // callback(null, false)                // 404 error
+                    },
+                    getManifestStream: (req, callback) => { // return the correct .m3u8 file
+                        // "req" is the http request
+                        // "callback" must be called with error-first arguments
+                        callback(null, createReadStream(req.filePath));
+                        // or
+                        // callback(new Error("Server error!"), null)
+                    },
+                    getSegmentStream: (req, callback) => { // return the correct .ts file
+                        callback(null, createReadStream(req.filePath, { highWaterMark: 64 * 1024 }));
+                    }
+                }
+            });
 
-        this.app.get('/', (req, res: express.Response) => {
-            res.staHlsCode = 200;
-            res.setHeader('Content-Type', 'text/html');
-            res.sendFile(`${resolve(__dirname, "../../../public/hls/index.html")}`);
-        });
-        this.app.get('/convert-to-hls/:filename', (req, res: express.Response) => {
-            console.log("url: ", req.url)
-            console.log("params: ", req.params)
-            let { filename } = req.params;
-            this.ToHls$(`./uploads/video/${filename}`).subscribe(val => {
-                res.send(val);
+
+            process.on('uncaughtException', (error) => {
+                let errorStr = String(error)
+                // 其他处理机制
+                if (errorStr.match(/listen EACCES: permission denied/) ||
+                    errorStr.match(/listen EADDRINUSE: address already in use/)) {
+                    let lastColonIndex = errorStr.lastIndexOf(":"),
+                        portInString = errorStr.slice(lastColonIndex + 1);
+                    // this.httpServer.listening
+                    if (this.port == Number(portInString) && !this.httpServer.listening) {
+                        HlsRegister.OccupiedPortSet.add(this.port);
+                        HlsRegister.ServePortSet.delete(this.port)
+                        this.getNewRandomPort();
+                        this._port = this.newRandomPort;
+                        HlsRegister.isPrintDetail ? console.log(`${errorStr}, retry with port `) : null;
+                        console.log(this.httpServer.listening);
+                        console.log(`${errorStr}, retry with port: ${this.port}`);
+                        this.serverInitCount += 1;
+                        this.initializeHlsServer();
+                    }
+                }
             })
-        });
-
-        this._hlsServer = new HlsServer(this._app, {
-            path: this.path, // Base URI to output Hls streams
-            dir: this.dir, // Directory that input files are stored
-            provider: {
-                exists: (req, callback) => { // check if a file exists (always called before the below methods)
-                    // console.log("hlsServer.provider.exists", req.filePath);
-                    let exists = existsSync(req.filePath);
-                    callback(null, exists);
-                    // callback(null, true)                 // File exists and is ready to start streaming
-                    // callback(new Error("Server Error!")) // 500 error
-                    // callback(null, false)                // 404 error
-                },
-                getManifestStream: (req, callback) => { // return the correct .m3u8 file
-                    // "req" is the http request
-                    // "callback" must be called with error-first arguments
-                    callback(null, createReadStream(req.filePath));
-                    // or
-                    // callback(new Error("Server error!"), null)
-                },
-                getSegmentStream: (req, callback) => { // return the correct .ts file
-                    callback(null, createReadStream(req.filePath, { highWaterMark: 64 * 1024 }));
-                }
-            }
-        });
-
-
-        process.on('uncaughtException', (error) => {
-            let errorStr = String(error)
-            // 其他处理机制
-            if (errorStr.match(/listen EACCES: permission denied/) ||
-                errorStr.match(/listen EADDRINUSE: address already in use/)) {
-                let lastColonIndex = errorStr.lastIndexOf(":"),
-                    portInString = errorStr.slice(lastColonIndex + 1);
-                // this.httpServer.listening
-                if (this.port == Number(portInString) && !this.httpServer.listening) {
-                    HlsRegister.OccupiedPortSet.add(this.port);
-                    HlsRegister.ServePortSet.delete(this.port)
-                    this.getNewRandomPort();
-                    this._port = this.newRandomPort;
-                    HlsRegister.isPrintDetail ? console.log(`${errorStr}, retry with port `) : null;
-                    console.log(this.httpServer.listening);
-                    console.log(`${errorStr}, retry with port: ${this.port}`);
-                    this.serverInitCount += 1;
-                    this.initializeHlsServer();
-                }
-            }
-        })
-        this.initializeHlsServer();
+            this.initializeHlsServer();
+        } catch (error) {
+            console.error(error);
+        }
     }
 
 
@@ -311,7 +317,7 @@ export class HlsStandalone {
     private _DefaultToHLSOptions: ToHLSOptions = {
         outputDir: "./convert/hls",
         isRandomFileName: false,
-        outputFileName: v4Generator(),
+        outputFileName: v4(),
         options: [
             // '-re',
             // '-stream_loop -1',
@@ -338,7 +344,7 @@ export class HlsStandalone {
         let filePathSplit = filePath.split("/") // e.g. "./uploads/video/df89dca9-9d87-4f49-8600-625eeb137428.mp4"
         let originalFileName = filePathSplit[filePathSplit.length - 1] // e.g. "df89dca9-9d87-4f49-8600-625eeb137428.mp4"
             .split(".")[0]; // e.g. "df89dca9-9d87-4f49-8600-625eeb137428"
-        configs['outputFileName'] = !!configs['isRandomFileName'] ? v4Generator() : originalFileName;
+        configs['outputFileName'] = !!configs['isRandomFileName'] ? v4() : originalFileName;
         return new Promise<{}>((_resolve, _reject) => {
             var startTime = performance.now();
             if (!existsSync(filePath)) _reject(`${filePath} is not exists!`);
